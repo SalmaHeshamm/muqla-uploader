@@ -1,5 +1,6 @@
 import io
 import re
+import threading
 from datetime import datetime
 
 import streamlit as st
@@ -43,8 +44,18 @@ def ar_num(n):
 # Google Drive
 # =========================================================
 
+# Serializes folder lookup/creation across all concurrent users so two
+# people registering the same speaker name at the same moment can't both
+# decide "it doesn't exist yet" and create duplicate folders.
+_folder_lock = threading.Lock()
+
+# Serializes credential refreshes so concurrent sessions never call
+# creds.refresh() on the same object at the same time.
+_creds_lock = threading.Lock()
+
+
 @st.cache_resource(show_spinner=False)
-def get_drive_service():
+def get_drive_credentials():
     creds = Credentials(
         token=None,
         refresh_token=st.secrets["oauth_refresh_token"],
@@ -56,10 +67,28 @@ def get_drive_service():
 
     creds.refresh(Request())
 
+    return creds
+
+
+def get_drive_service():
+    # The Credentials object itself is cached/shared across every user's
+    # session (that part is fine, it's just a token holder). What must
+    # NOT be shared across threads is the underlying http/service object
+    # from googleapiclient, since httplib2.Http is documented as not
+    # thread-safe. So we build a brand-new service instance per call,
+    # using the shared, refreshed credentials.
+    creds = get_drive_credentials()
+
+    if not creds.valid:
+        with _creds_lock:
+            if not creds.valid:
+                creds.refresh(Request())
+
     return build(
         "drive",
         "v3",
         credentials=creds,
+        cache_discovery=False,
     )
 
 
@@ -119,12 +148,18 @@ def resolve_speaker_folder(
 
 
 def find_or_create_subfolder(service, parent_folder_id, name):
-    return resolve_speaker_folder(
-        service,
-        parent_folder_id,
-        name,
-        create_if_missing=True,
-    )
+    # Only one session at a time is allowed to check "does this speaker's
+    # folder exist?" and, if not, create it. Without this lock, two people
+    # registering the same name in the same instant could both see "not
+    # found" and each create their own folder, splitting that speaker's
+    # recordings across two duplicate folders.
+    with _folder_lock:
+        return resolve_speaker_folder(
+            service,
+            parent_folder_id,
+            name,
+            create_if_missing=True,
+        )
 
 
 def upload_audio(
